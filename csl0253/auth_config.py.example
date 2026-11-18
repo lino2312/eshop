@@ -1,0 +1,14 @@
+"""
+认证配置文件示例
+请根据实际情况修改此文件，然后重命名为 auth_config.py
+"""
+
+# ginAuth 服务器地址
+AUTH_SERVER_URL = "http://localhost:8080/api"
+
+# 从 ginAuth 管理后台获取的 AppKey
+# 请登录 ginAuth 管理后台，创建或查看软件信息，复制 AppKey 到此处
+APP_KEY = ""
+
+# 设备信息（可选，留空则自动获取）
+DEVICE_INFO = ""

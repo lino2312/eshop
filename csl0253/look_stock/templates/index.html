@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>库存监控系统</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 20px;
+            color: #4ade80;
+        }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .tab {
+            padding: 10px 20px;
+            background: #16213e;
+            border: 1px solid #0f3460;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .tab:hover {
+            background: #1f4068;
+        }
+        .tab.active {
+            background: #4ade80;
+            color: #1a1a2e;
+            font-weight: bold;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: #16213e;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            border: 1px solid #0f3460;
+        }
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #4ade80;
+        }
+        .stat-value.error {
+            color: #ef4444;
+        }
+        .stat-label {
+            font-size: 0.9em;
+            color: #888;
+            margin-top: 5px;
+        }
+        .filters {
+            background: #16213e;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            align-items: center;
+        }
+        .filter-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .filter-group label {
+            font-size: 0.85em;
+            color: #888;
+        }
+        .filter-group select, .filter-group input {
+            background: #0f3460;
+            color: #eee;
+            border: 1px solid #1f4068;
+            padding: 8px 12px;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        .filter-group select:focus, .filter-group input:focus {
+            outline: none;
+            border-color: #4ade80;
+        }
+        .btn {
+            background: #4ade80;
+            color: #1a1a2e;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+            margin-top: auto;
+        }
+        .btn:hover {
+            background: #22c55e;
+        }
+        .btn-danger {
+            background: #ef4444;
+            color: #fff;
+        }
+        .btn-danger:hover {
+            background: #dc2626;
+        }
+        .table-container {
+            background: #16213e;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        thead {
+            background: #0f3460;
+        }
+        th, td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #1f4068;
+        }
+        th {
+            font-weight: 600;
+            color: #4ade80;
+        }
+        tr:hover {
+            background: #1f4068;
+        }
+        .in-stock {
+            color: #4ade80;
+            font-weight: bold;
+        }
+        .out-stock {
+            color: #ef4444;
+        }
+        .last-update {
+            text-align: center;
+            margin-top: 15px;
+            color: #888;
+        }
+        .summary-section {
+            background: #16213e;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 15px;
+        }
+        .summary-card {
+            background: #0f3460;
+            padding: 15px;
+            border-radius: 8px;
+        }
+        .summary-card.in-stock {
+            border-left: 4px solid #4ade80;
+        }
+        .summary-card.out-stock {
+            border-left: 4px solid #ef4444;
+        }
+        .summary-title {
+            font-size: 0.9em;
+            color: #888;
+            margin-bottom: 5px;
+        }
+        .summary-status {
+            font-size: 1.2em;
+            font-weight: bold;
+        }
+        .summary-time {
+            font-size: 0.8em;
+            color: #666;
+            margin-top: 5px;
+        }
+        /* Error log specific styles */
+        .error-type {
+            font-weight: bold;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 0.85em;
+        }
+        .error-type.IP_BLOCKED, .error-type.RATE_LIMIT {
+            background: #7f1d1d;
+            color: #fca5a5;
+        }
+        .error-type.TIMEOUT, .error-type.CONNECTION_ERROR {
+            background: #78350f;
+            color: #fdba74;
+        }
+        .error-type.HTTP_ERROR, .error-type.SERVER_ERROR, .error-type.SERVICE_UNAVAILABLE {
+            background: #713f12;
+            color: #fde047;
+        }
+        .error-type.JSON_PARSE_ERROR, .error-type.INVALID_RESPONSE, .error-type.DATA_STRUCTURE_ERROR {
+            background: #1e3a5f;
+            color: #93c5fd;
+        }
+        .error-type.REQUEST_ERROR, .error-type.UNKNOWN_ERROR {
+            background: #312e81;
+            color: #c4b5fd;
+        }
+        .error-message {
+            color: #fca5a5;
+            font-size: 0.9em;
+            max-width: 300px;
+            word-break: break-word;
+        }
+        .url-cell {
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 0.85em;
+            color: #94a3b8;
+        }
+        .response-text {
+            max-width: 250px;
+            font-size: 0.8em;
+            color: #94a3b8;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .error-stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 15px;
+        }
+        .error-stat-card {
+            background: #2d1f1f;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #7f1d1d;
+        }
+        .error-stat-type {
+            font-size: 0.8em;
+            color: #fca5a5;
+            margin-bottom: 5px;
+            word-break: break-word;
+        }
+        .error-stat-count {
+            font-size: 1.5em;
+            font-weight: bold;
+            color: #ef4444;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📱 iPhone 库存监控系统</h1>
+
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('stock')">库存数据</div>
+            <div class="tab" onclick="switchTab('errors')">错误日志</div>
+        </div>
+
+        <!-- 库存数据标签页 -->
+        <div id="stock-tab" class="tab-content active">
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-value" id="total-checks">0</div>
+                    <div class="stat-label">总检查次数</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="in-stock-count">0</div>
+                    <div class="stat-label">有库存次数</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="out-stock-count">0</div>
+                    <div class="stat-label">无库存次数</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="variants-count">0</div>
+                    <div class="stat-label">监控型号数</div>
+                </div>
+            </div>
+
+            <div class="summary-section">
+                <h2 style="margin-bottom: 15px; color: #4ade80;">最新库存状态</h2>
+                <div class="summary-grid" id="summary-grid"></div>
+            </div>
+
+            <div class="filters">
+                <div class="filter-group">
+                    <label>产品</label>
+                    <select id="filter-product">
+                        <option value="">全部</option>
+                        <option value="iphone_17">iPhone 17</option>
+                        <option value="iphone_17_pro">iPhone 17 Pro</option>
+                        <option value="iphone_17_pro_max">iPhone 17 Pro Max</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>颜色</label>
+                    <select id="filter-color">
+                        <option value="">全部</option>
+                        <option value="25">黑色</option>
+                        <option value="962">白色</option>
+                        <option value="16827">藍色</option>
+                        <option value="15121">薰衣草紫色</option>
+                        <option value="31032">鼠尾草綠色</option>
+                        <option value="927">銀色</option>
+                        <option value="31033">宇宙橙色</option>
+                        <option value="31034">深墨藍色</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>ROM</label>
+                    <select id="filter-rom">
+                        <option value="">全部</option>
+                        <option value="1025">256GB</option>
+                        <option value="1026">512GB</option>
+                        <option value="1027">1TB</option>
+                        <option value="4697">2TB</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>库存状态</label>
+                    <select id="filter-stock">
+                        <option value="">全部</option>
+                        <option value="1">有库存</option>
+                        <option value="0">无库存</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>时间范围(小时)</label>
+                    <select id="filter-hours">
+                        <option value="1">1小时</option>
+                        <option value="6">6小时</option>
+                        <option value="12">12小时</option>
+                        <option value="24" selected>24小时</option>
+                        <option value="48">48小时</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>显示条数</label>
+                    <input type="number" id="filter-limit" value="1000" min="10" max="10000">
+                </div>
+                <button class="btn" onclick="applyFilters()">应用筛选</button>
+                <button class="btn" onclick="autoRefresh()" id="refresh-btn">自动刷新: 关</button>
+            </div>
+
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>产品</th>
+                            <th>颜色ID</th>
+                            <th>ROM ID</th>
+                            <th>状态</th>
+                            <th>检查时间</th>
+                        </tr>
+                    </thead>
+                    <tbody id="stock-table"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- 错误日志标签页 -->
+        <div id="errors-tab" class="tab-content">
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-value error" id="total-errors">0</div>
+                    <div class="stat-label">总错误数</div>
+                </div>
+            </div>
+
+            <div class="summary-section">
+                <h2 style="margin-bottom: 15px; color: #ef4444;">错误类型统计</h2>
+                <div class="error-stats-grid" id="error-stats-grid"></div>
+            </div>
+
+            <div class="filters">
+                <div class="filter-group">
+                    <label>产品</label>
+                    <select id="error-filter-product">
+                        <option value="">全部</option>
+                        <option value="iphone_17">iPhone 17</option>
+                        <option value="iphone_17_pro">iPhone 17 Pro</option>
+                        <option value="iphone_17_pro_max">iPhone 17 Pro Max</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>错误类型</label>
+                    <select id="error-filter-type">
+                        <option value="">全部</option>
+                        <option value="IP_BLOCKED">IP被封</option>
+                        <option value="RATE_LIMIT">请求限制</option>
+                        <option value="TIMEOUT">超时</option>
+                        <option value="CONNECTION_ERROR">连接错误</option>
+                        <option value="HTTP_ERROR">HTTP错误</option>
+                        <option value="SERVER_ERROR">服务器错误</option>
+                        <option value="SERVICE_UNAVAILABLE">服务不可用</option>
+                        <option value="JSON_PARSE_ERROR">JSON解析错误</option>
+                        <option value="INVALID_RESPONSE">响应无效</option>
+                        <option value="DATA_STRUCTURE_ERROR">数据结构错误</option>
+                        <option value="REQUEST_ERROR">请求错误</option>
+                        <option value="UNKNOWN_ERROR">未知错误</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>时间范围(小时)</label>
+                    <select id="error-filter-hours">
+                        <option value="1">1小时</option>
+                        <option value="6">6小时</option>
+                        <option value="12">12小时</option>
+                        <option value="24" selected>24小时</option>
+                        <option value="48">48小时</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>显示条数</label>
+                    <input type="number" id="error-filter-limit" value="100" min="10" max="1000">
+                </div>
+                <button class="btn btn-danger" onclick="applyErrorFilters()">应用筛选</button>
+                <button class="btn btn-danger" onclick="autoRefreshErrors()" id="refresh-error-btn">自动刷新: 关</button>
+            </div>
+
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>时间</th>
+                            <th>产品</th>
+                            <th>颜色ID</th>
+                            <th>错误类型</th>
+                            <th>错误信息</th>
+                            <th>URL</th>
+                            <th>状态码</th>
+                            <th>响应</th>
+                        </tr>
+                    </thead>
+                    <tbody id="error-table"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="last-update">
+            最后更新: <span id="last-update">--</span>
+        </div>
+    </div>
+
+    <script>
+        let autoRefreshInterval = null;
+        let autoRefreshErrorInterval = null;
+        let currentTab = 'stock';
+
+        // 颜色映射
+        const colorMap = {
+            "25": "黑色",
+            "962": "白色",
+            "16827": "藍色",
+            "15121": "薰衣草紫色",
+            "31032": "鼠尾草綠色",
+            "927": "銀色",
+            "31033": "宇宙橙色",
+            "31034": "深墨藍色",
+        };
+
+        // ROM映射
+        const romMap = {
+            "1025": "256GB",
+            "1026": "512GB",
+            "1027": "1TB",
+            "4697": "2TB",
+        };
+
+        function formatDate(dateStr) {
+            const date = new Date(dateStr);
+            // 减去8小时以匹配北京时间
+            date.setHours(date.getHours() - 8);
+            return date.toLocaleString('zh-CN', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+
+        function switchTab(tab) {
+            currentTab = tab;
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelector(`.tab[onclick="switchTab('${tab}')"]`).classList.add('active');
+            document.getElementById(`${tab}-tab`).classList.add('active');
+
+            if (tab === 'errors') {
+                loadErrorStats();
+                loadErrorData();
+            } else {
+                loadStats();
+                loadSummary();
+                loadStockData();
+            }
+        }
+
+        // 库存数据相关函数
+        async function loadStats() {
+            const response = await fetch('/api/stock/stats');
+            const data = await response.json();
+            document.getElementById('total-checks').textContent = data.total_checks || 0;
+            document.getElementById('in-stock-count').textContent = data.in_stock_count || 0;
+            document.getElementById('out-stock-count').textContent = data.out_of_stock_count || 0;
+            document.getElementById('variants-count').textContent = data.variants || 0;
+        }
+
+        async function loadSummary() {
+            const response = await fetch('/api/stock/summary');
+            const data = await response.json();
+            const grid = document.getElementById('summary-grid');
+            grid.innerHTML = '';
+
+            data.forEach(item => {
+                const card = document.createElement('div');
+                card.className = `summary-card ${item.in_stock ? 'in-stock' : 'out-stock'}`;
+                const colorName = colorMap[item.color_id] || item.color_id;
+                const romName = romMap[item.rom_id] || item.rom_id;
+                card.innerHTML = `
+                    <div class="summary-title">${item.product_name} | 颜色: ${colorName} | ROM: ${romName}</div>
+                    <div class="summary-status">${item.in_stock ? '✓ 有库存' : '✗ 无库存'}</div>
+                    <div class="summary-time">检查于: ${formatDate(item.last_check)}</div>
+                `;
+                grid.appendChild(card);
+            });
+        }
+
+        async function loadStockData() {
+            const product = document.getElementById('filter-product').value;
+            const colorId = document.getElementById('filter-color').value;
+            const romId = document.getElementById('filter-rom').value;
+            const inStock = document.getElementById('filter-stock').value;
+            const hours = document.getElementById('filter-hours').value;
+            const limit = document.getElementById('filter-limit').value;
+
+            let url = `/api/stock?hours=${hours}&limit=${limit}`;
+            if (product) url += `&product=${encodeURIComponent(product)}`;
+            if (colorId) url += `&color_id=${encodeURIComponent(colorId)}`;
+            if (romId) url += `&rom_id=${encodeURIComponent(romId)}`;
+            if (inStock !== '') url += `&in_stock=${inStock}`;
+
+            const response = await fetch(url);
+            const data = await response.json();
+
+            const tbody = document.getElementById('stock-table');
+            tbody.innerHTML = '';
+
+            data.forEach(row => {
+                const tr = document.createElement('tr');
+                const colorName = colorMap[row.color_id] || row.color_id;
+                const romName = romMap[row.rom_id] || row.rom_id;
+                tr.innerHTML = `
+                    <td>${row.product_name}</td>
+                    <td>${colorName}</td>
+                    <td>${romName}</td>
+                    <td class="${row.in_stock ? 'in-stock' : 'out-stock'}">
+                        ${row.in_stock ? '✓ 有库存' : '✗ 无库存'}
+                    </td>
+                    <td>${formatDate(row.check_time)}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            document.getElementById('last-update').textContent = formatDate(new Date());
+        }
+
+        function applyFilters() {
+            loadStats();
+            loadSummary();
+            loadStockData();
+        }
+
+        function autoRefresh() {
+            const btn = document.getElementById('refresh-btn');
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+                autoRefreshInterval = null;
+                btn.textContent = '自动刷新: 关';
+            } else {
+                applyFilters();
+                autoRefreshInterval = setInterval(applyFilters, 3000);
+                btn.textContent = '自动刷新: 开';
+            }
+        }
+
+        // 错误日志相关函数
+        async function loadErrorStats() {
+            const response = await fetch('/api/errors/summary');
+            const data = await response.json();
+
+            let totalErrors = 0;
+            data.forEach(item => totalErrors += item.error_count);
+            document.getElementById('total-errors').textContent = totalErrors;
+
+            const grid = document.getElementById('error-stats-grid');
+            grid.innerHTML = '';
+
+            data.forEach(item => {
+                const card = document.createElement('div');
+                card.className = 'error-stat-card';
+                card.innerHTML = `
+                    <div class="error-stat-type">${item.error_type}</div>
+                    <div class="error-stat-count">${item.error_count}</div>
+                `;
+                grid.appendChild(card);
+            });
+        }
+
+        async function loadErrorData() {
+            const product = document.getElementById('error-filter-product').value;
+            const errorType = document.getElementById('error-filter-type').value;
+            const hours = document.getElementById('error-filter-hours').value;
+            const limit = document.getElementById('error-filter-limit').value;
+
+            let url = `/api/errors?hours=${hours}&limit=${limit}`;
+            if (product) url += `&product=${encodeURIComponent(product)}`;
+            if (errorType) url += `&error_type=${encodeURIComponent(errorType)}`;
+
+            const response = await fetch(url);
+            const data = await response.json();
+
+            const tbody = document.getElementById('error-table');
+            tbody.innerHTML = '';
+
+            data.forEach(row => {
+                const tr = document.createElement('tr');
+                const colorName = colorMap[row.color_id] || row.color_id;
+                tr.innerHTML = `
+                    <td>${formatDate(row.error_time)}</td>
+                    <td>${row.product_name}</td>
+                    <td>${colorName}</td>
+                    <td><span class="error-type ${row.error_type}">${row.error_type}</span></td>
+                    <td class="error-message">${row.error_message}</td>
+                    <td class="url-cell" title="${row.url || ''}">${row.url || '-'}</td>
+                    <td>${row.status_code || '-'}</td>
+                    <td class="response-text" title="${row.response_text || ''}">${row.response_text || '-'}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            document.getElementById('last-update').textContent = formatDate(new Date());
+        }
+
+        function applyErrorFilters() {
+            loadErrorStats();
+            loadErrorData();
+        }
+
+        function autoRefreshErrors() {
+            const btn = document.getElementById('refresh-error-btn');
+            if (autoRefreshErrorInterval) {
+                clearInterval(autoRefreshErrorInterval);
+                autoRefreshErrorInterval = null;
+                btn.textContent = '自动刷新: 关';
+            } else {
+                applyErrorFilters();
+                autoRefreshErrorInterval = setInterval(applyErrorFilters, 3000);
+                btn.textContent = '自动刷新: 开';
+            }
+        }
+
+        // 初始加载
+        applyFilters();
+    </script>
+</body>
+</html>
