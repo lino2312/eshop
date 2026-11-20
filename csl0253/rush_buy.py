@@ -43,7 +43,7 @@ logging.basicConfig(
     ]
 )
 
-VERSION = "V2.0.1"
+VERSION = "V2.0.2"
 TARGET_URL = ""
 LOGIN_URL = "https://eshop.hkcsl.com/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Login-Show"
 CHECKOUT_URL = "https://eshop.hkcsl.com/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Checkout-Begin?stage=payment"

@@ -30,33 +30,54 @@ def _build_message(to_email, subject, content):
     return msg
 
 
+def _close_quietly(server):
+    """信已经交给服务器之后，关闭连接失败不能当成发送失败，否则会再发一封。"""
+    try:
+        server.quit()
+    except Exception:
+        try:
+            server.close()
+        except Exception:
+            pass
+
+
+def _deliver(server, to_email, payload):
+    server.login(FROM_EMAIL, FROM_PASSWORD)
+    server.sendmail(FROM_EMAIL, [to_email], payload)
+    _close_quietly(server)
+
+
 def _send_once(to_email, subject, content):
-    """单次发送：先试 SSL 465，再试 STARTTLS 587。"""
+    """单次发送：先试 SSL 465，只有这封还没被服务器收下才再试 STARTTLS 587。"""
     payload = _build_message(to_email, subject, content).as_string()
     last_error = None
 
     # 方式1：SMTP_SSL 465（QQ 常用）
+    server = None
     try:
         context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(SMTP_HOST, 465, timeout=30, context=context) as server:
-            server.login(FROM_EMAIL, FROM_PASSWORD)
-            server.sendmail(FROM_EMAIL, [to_email], payload)
+        server = smtplib.SMTP_SSL(SMTP_HOST, 465, timeout=30, context=context)
+        _deliver(server, to_email, payload)
         return True
     except Exception as e:
         last_error = e
+        if server is not None:
+            _close_quietly(server)
 
-    # 方式2：STARTTLS 587（SSL 偶发 EOF 时的备用通道）
+    # 方式2：STARTTLS 587。只在 465 没把信交出去时才走，避免同一封发两次
+    server = None
     try:
         context = ssl.create_default_context()
-        with smtplib.SMTP(SMTP_HOST, 587, timeout=30) as server:
-            server.ehlo()
-            server.starttls(context=context)
-            server.ehlo()
-            server.login(FROM_EMAIL, FROM_PASSWORD)
-            server.sendmail(FROM_EMAIL, [to_email], payload)
+        server = smtplib.SMTP(SMTP_HOST, 587, timeout=30)
+        server.ehlo()
+        server.starttls(context=context)
+        server.ehlo()
+        _deliver(server, to_email, payload)
         return True
     except Exception as e:
         last_error = e
+        if server is not None:
+            _close_quietly(server)
 
     raise last_error
 
