@@ -25,23 +25,30 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from auth_client import verify_auth, report_order_success
 from base.add_cart import base_add_cart
-from send_email import send_email
+from send_email import send_email, send_success_emails
 import json
+import re
+import sys
+import traceback
+
+# 打包后双击运行时当前目录不是程序目录，account.txt 等文件需按程序所在目录查找
+APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [%(threadName)s] - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('rush_buy.log', encoding='utf-8'),
+        logging.FileHandler(os.path.join(APP_DIR, 'rush_buy.log'), encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 
+VERSION = "V2.0.1"
 TARGET_URL = ""
 LOGIN_URL = "https://eshop.hkcsl.com/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Login-Show"
 CHECKOUT_URL = "https://eshop.hkcsl.com/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Checkout-Begin?stage=payment"
 CART_URL = "https://eshop.hkcsl.com/zh_HK/cart"
-CHECK_INTERVAL = 0
+CHECK_INTERVAL = 1.5
 VERBOSE_STOCK_LOG = False
 FAST_ACTION_DELAY = 0.05
 FAST_POST_CLICK_DELAY = 0.1
@@ -141,6 +148,52 @@ class PortManager:
             self.used_ports.discard(port)
 
 port_manager = PortManager()
+
+
+ADD_CART_API = "https://eshop.hkcsl.com/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Cart-AddProduct"
+
+
+def get_pid(goods_choice, color, storage):
+    """根据商品编号、颜色值、容量值返回 variant pid。无对照表时返回空字符串。"""
+    if goods_choice == "3":  # iPhone 17
+        pid_map = {
+            ("25", "1025"): "4030131scol", ("25", "1026"): "4030181scol",
+            ("962", "1025"): "4030141scol", ("962", "1026"): "4030191scol",
+            ("16827", "1025"): "4030151scol", ("16827", "1026"): "4030201scol",
+            ("15121", "1025"): "4030161scol", ("15121", "1026"): "4030211scol",
+            ("31032", "1025"): "4030171scol", ("31032", "1026"): "4030221scol",
+        }
+    elif goods_choice == "2":  # iPhone 17 Pro
+        pid_map = {
+            ("927", "1025"): "4030351scol", ("927", "1026"): "4030381scol", ("927", "1027"): "4030411scol",
+            ("31033", "1025"): "4030361scol", ("31033", "1026"): "4030391scol", ("31033", "1027"): "4030421scol",
+            ("31034", "1025"): "4030371scol", ("31034", "1026"): "4030401scol", ("31034", "1027"): "4030431scol",
+        }
+    elif goods_choice == "1":  # iPhone 17 Pro Max
+        pid_map = {
+            ("927", "1025"): "4030011scol", ("927", "1026"): "4030041scol",
+            ("927", "1027"): "4030071scol", ("927", "4697"): "4030101scol",
+            ("31033", "1025"): "4030021scol", ("31033", "1026"): "4030051scol",
+            ("31033", "1027"): "4030081scol", ("31033", "4697"): "4030111scol",
+            ("31034", "1025"): "4030031scol", ("31034", "1026"): "4030061scol",
+            ("31034", "1027"): "4030091scol", ("31034", "4697"): "4030121scol",
+        }
+    else:
+        pid_map = {}
+    return pid_map.get((str(color), str(storage)), "")
+
+
+def master_pid_from_url(url):
+    """商品页 URL 的文件名就是主商品 pid，如 .../IP18_promaxscol.html -> IP18_promaxscol"""
+    return url.split("?")[0].rstrip("/").rsplit("/", 1)[-1].replace(".html", "")
+
+
+def phone_model(text):
+    """从商品名中提取机型，如 'Apple iPhone 18 Pro Max 256GB' -> ('18', 'promax')；非 iPhone 返回 None"""
+    m = re.search(r"iphone[\s_]*(\d+)[\s_]*(pro[\s_]*max|pro|plus|air)?", (text or "").lower())
+    if not m:
+        return None
+    return m.group(1), re.sub(r"[\s_]", "", m.group(2) or "")
 
 
 def play_success_sound(sound_file='y1871.wav', repeat=3):
@@ -379,6 +432,13 @@ class RushBuyBot:
         self.is_pro_model = False
         self.goods_choice = goods_choice
         self.new_tab = None
+        # 选购结果绑在实例上，加购/导航一律用这里的值，不依赖全局 TARGET_URL
+        if not scavenge_mode and goods_choice in goods_options:
+            self.target_url = goods_options[goods_choice]["url"]
+            self.target_name = goods_options[goods_choice]["name"]
+        else:
+            self.target_url = TARGET_URL or ""
+            self.target_name = goods_options.get(goods_choice, {}).get("name", "")
 
     def cleanup_chrome_processes(self):
         """清理残留的 Chrome 进程"""
@@ -400,7 +460,7 @@ class RushBuyBot:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                base_dir = os.path.dirname(os.path.abspath(__file__))
+                base_dir = APP_DIR
                 
                 self.logger.info(f"🚀 使用 DrissionPage 初始化浏览器... (尝试 {attempt + 1}/{max_retries})")
                 
@@ -509,6 +569,36 @@ class RushBuyBot:
         if self.user_data_dir and os.path.exists(self.user_data_dir):
             import shutil
             shutil.rmtree(self.user_data_dir, ignore_errors=True)
+
+    def _is_cf_challenge_page(self, tab=None):
+        tab = tab or self.tab
+        try:
+            title = (tab.title or "").lower()
+        except Exception:
+            title = ""
+        return "just a moment" in title or "請稍候" in title or "请稍候" in title
+
+    def _wait_user_pass_cf(self, reason="请求被拦截", timeout=180):
+        """加购等请求被 Cloudflare 拦住时，提醒人在浏览器里点验证，通过后继续。不自动破解验证。"""
+        self.logger.warning(f"⚠️ Cloudflare 拦截（{reason}），请到机器人浏览器窗口点击验证")
+        print("\n" + "=" * 56)
+        print("⚠️ 被 Cloudflare 拦截了！")
+        print("请到机器人打开的 Chrome 窗口里，点击 Just a moment / 验证")
+        print(f"通过后程序会自动继续（最长等 {timeout} 秒）")
+        print("=" * 56 + "\n")
+        try:
+            if not self._is_cf_challenge_page():
+                self.tab.get(self.target_url)
+        except Exception:
+            pass
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._is_cf_challenge_page() and self._on_target_page():
+                self.logger.info("✅ Cloudflare 验证已通过，继续抢购")
+                return True
+            time.sleep(2)
+        self.logger.error("❌ 等待 Cloudflare 验证超时")
+        return False
 
     def wait_for_verification(self, max_attempts=20, check_interval=3):
         """持续检测并处理Cloudflare验证页面，直到成功进入站点"""
@@ -686,6 +776,10 @@ class RushBuyBot:
                 self.tab.get(LOGIN_URL)
                 self.wait_for_verification()
                 time.sleep(1)
+                # 已登录时访问登录页会被跳转到帐户页
+                if "Account-Show" in (self.tab.url or ""):
+                    self.logger.info(f"已处于登录状态（{self.tab.url}），登录成功！")
+                    return True
                 try:
                     # cookies按钮 class="affirm btn cookie-btn"，文案"明白!"
                     # 先等弹窗真正显示(#consent-tracking 出现 show 类)，避免命中未显示的按钮导致点击失败
@@ -778,11 +872,12 @@ class RushBuyBot:
                 self.wait_for_verification(max_attempts=3, check_interval=2)
                 
                 current_url = self.tab.url
-                if "Login-Show" not in current_url:
+                # CSRF-Fail 是站点的报错页（未登录），不能当成登录成功
+                if "Login-Show" not in current_url and "CSRF-Fail" not in current_url:
                     self.logger.info("登录成功！")
                     return True
                 else:
-                    self.logger.error("登录失败")
+                    self.logger.error(f"登录失败（当前页面: {current_url}）")
                     return False
 
             except Exception as e:
@@ -823,16 +918,54 @@ class RushBuyBot:
         self.tab = self.browser.new_tab()
         return self.tab
 
+    def _target_master(self):
+        return master_pid_from_url(self.target_url)
+
+    def _on_target_page(self):
+        return self._target_master().lower() in (self.tab.url or "").split("?")[0].lower()
+
+    def _check_cart_before_rush(self):
+        """第二个页面会结算整个购物车：购物车里若已有其他机型，下单的就不是所选手机。返回 False 表示不能继续。"""
+        js = """
+return fetch('/zh_HK/cart', {credentials: 'include'}).then(r => r.text()).then(html => {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  return JSON.stringify([...doc.querySelectorAll('.line-item-name')].map(e => e.textContent.trim()));
+}).catch(e => JSON.stringify({error: String(e)}));
+"""
+        try:
+            names = json.loads(self.tab.run_js(js, timeout=60))
+        except Exception as e:
+            self.logger.warning(f"⚠️ 读取购物车失败，跳过购物车检查: {e}")
+            return True
+        if not isinstance(names, list):
+            self.logger.warning(f"⚠️ 读取购物车失败，跳过购物车检查: {names}")
+            return True
+        self.logger.info(f"当前购物车商品: {names if names else '空'}")
+        target_model = phone_model(goods_options[self.goods_choice]["name"])
+        others = [n for n in names if phone_model(n) and phone_model(n) != target_model]
+        if others:
+            self.logger.error(f"❌ 购物车里已有其他手机 {others}，提交订单会把它们一起下单。请先清空该账号购物车再运行")
+            return False
+        if any(phone_model(n) == target_model for n in names):
+            self.logger.warning("⚠️ 购物车里已有所选机型，可能占用限购数量")
+        return True
+
     def navigate_to_product(self):
         """导航到商品页面"""
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
                 self._ensure_live_tab()
-                self.logger.info("导航到商品页面...")
-                self.tab.get(TARGET_URL)
+                self.logger.info(f"导航到商品页面: {self.target_url}")
+                self.tab.get(self.target_url)
+                self._step(f"商品页开始加载，等页面主体出现。当前地址={self.tab.url}")
                 self.tab.wait.ele_displayed("xpath=//*[@id='pdpContainer']/div[10]/div[1]/div/div/div[1]/div[1]")
+                self._step(f"商品页主体已出现 地址={self.tab.url}")
                 self.tab.stop_loading()  # 主动停止加载
+                if not self._on_target_page():
+                    if "/zh_HK/home" in (self.tab.url or ""):
+                        raise RuntimeError(f"所选商品页 {self._target_master()} 被跳转到了首页，该商品页可能已下架/暂未开放，请换一个商品")
+                    raise RuntimeError(f"当前页面不是所选商品 {self._target_master()}: {self.tab.url}")
                 # time.sleep(1)
                 # self.wait_for_verification(max_attempts=5, check_interval=2)
                 self.detect_model_mode()
@@ -870,7 +1003,7 @@ class RushBuyBot:
 
     def detect_model_mode(self):
         """检测当前页面是 Pro 还是 Pro Max"""
-        url_lower = (self.tab.url or TARGET_URL).lower()
+        url_lower = (self.tab.url or self.target_url).lower()
 
         has_custom_select = False
         has_native_select = False
@@ -1629,8 +1762,7 @@ class RushBuyBot:
                 play_success_sound('y1871.wav', repeat=3)
                 # ok_content转换为字符串
                 ok_content_str = json.dumps(ok_content, ensure_ascii=False, indent=2)
-                # 发送订购成功邮件通知
-                send_email("抢购成功通知", ok_content_str)
+                send_success_emails("抢购成功通知", ok_content_str)
                 self.logger.info("浏览器将保持打开状态，按 Ctrl+C 终止程序...")
                 while True:
                     time.sleep(1)
@@ -1778,31 +1910,49 @@ class RushBuyBot:
         流程：GET Product-Variation(颜色+内存) 拿 variant pid → POST Cart-AddProduct。
         返回: "ok" 成功 / "fail" 失败 / "cf_blocked" 被Cloudflare拦截
         """
+        # 所有机型统一：先查 Product-Variation，核对站点返回的颜色/容量与所选一致，再用返回的 pid 加购。
+        # 不再用本地 pid 表直通加购（表错/站点改版时会买错机型）。
+        self._step(f"有货，开始 API 加购 数量={quantity} 颜色={self.target_color} 容量={self.target_storage} 页面={self.tab.url}")
         try:
+            from urllib.parse import urlencode, urlparse, parse_qsl
             from csl_test import check_stock_selenium as css
-            from urllib.parse import urlparse, parse_qs
-            base_url = css.LAST_VARIATION_URL
-            if not base_url:
-                self.logger.warning("⚠️ 监控尚未捕获到 variation 请求URL，无法使用API加购")
-                return "fail"
-            qs = parse_qs(urlparse(base_url).query)
-            master_pid = (qs.get("pid") or [None])[0]
-            if not master_pid:
-                self.logger.warning("⚠️ 无法从监控URL解析pid")
-                return "fail"
-            # 在监控捕获的颜色查询URL基础上追加内存参数，得到具体 variant（如 4030211scol）
-            var_url = f"{base_url}&dwvar_{master_pid}_internal_storage_rom={self.target_storage}"
+            master_pid = self._target_master()
+            # 站点的 dwvar_ 参数名里，pid 中的下划线写成双下划线（IP18_promaxscol -> IP18__promaxscol）
+            dw_key = master_pid.replace("_", "__")
+            params = {"pid": master_pid, "quantity": 1, "source": "ajax", "offerPriceId": "online-price"}
+            captured = css.LAST_VARIATION_URL or ""
+            captured_params = dict(parse_qsl(urlparse(captured).query))
+            if captured_params.get("pid") == master_pid:
+                params = captured_params
+            params[f"dwvar_{dw_key}_color"] = self.target_color
+            params[f"dwvar_{dw_key}_internal_storage_rom"] = self.target_storage
+            var_url = "/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Product-Variation?" + urlencode(params)
             add_url = "/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Cart-AddProduct"
             js = """
-return (async (varUrl, addUrl, qty) => {
+return (async (varUrl, addUrl, qty, wantColor, wantRom, wantModel) => {
   try {
     const r1 = await fetch(varUrl, {headers: {'X-Requested-With': 'XMLHttpRequest'}});
     if (r1.status !== 200) return {step: 'variation', status: r1.status};
     const d1 = await r1.json();
     const pid = d1.product && d1.product.id;
     const available = d1.product && d1.product.available;
+    const name = d1.product && d1.product.productName;
     if (!pid) return {step: 'variation', status: 200, error: 'no pid in response'};
-    if (available === false) return {step: 'variation', status: 200, pid: pid, available: false};
+    if (!name) return {step: 'variation', status: 200, error: 'no product name'};
+    const m = String(name).toLowerCase().replace(/\\s+/g, '').match(/iphone(\\d+)(promax|pro|plus|air)?/);
+    const gotModel = m ? ('iphone' + m[1] + (m[2] || '')) : '';
+    if (wantModel && gotModel !== wantModel) {
+      return {step: 'model_mismatch', status: 200, pid: pid, name: name, want: wantModel, got: gotModel};
+    }
+    const selected = {};
+    for (const attr of (d1.product.variationAttributes || [])) {
+      const v = (attr.values || []).find(x => x.selected);
+      selected[attr.attributeId || attr.id] = v ? String(v.id) : null;
+    }
+    if (selected.color !== String(wantColor) || selected.internal_storage_rom !== String(wantRom)) {
+      return {step: 'mismatch', status: 200, pid: pid, name: name, selected: selected};
+    }
+    if (available === false) return {step: 'variation', status: 200, pid: pid, name: name, available: false};
     const r2 = await fetch(addUrl, {
       method: 'POST',
       headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest'},
@@ -1816,21 +1966,25 @@ return (async (varUrl, addUrl, qty) => {
       return {step: 'add', status: r2.status, pid: pid, head: txt.slice(0, 150)};
     }
     // 明确失败
-    if (j.error) return {step: 'add', status: 200, pid: pid, jsonError: JSON.stringify(j).slice(0, 200)};
+    if (j.error) return {step: 'add', status: 200, pid: pid, name: name, jsonError: JSON.stringify(j).slice(0, 200)};
     // 明确成功
     if (j.success === true || 'quantityTotal' in j || 'cart' in j) {
-      return {step: 'add', status: 200, pid: pid, confirmed: true};
+      return {step: 'add', status: 200, pid: pid, name: name, confirmed: true};
     }
     // 响应结构不明确：拉取购物车页面确认 variant 是否在其中
     const rc = await fetch('/zh_HK/cart', {credentials: 'same-origin'});
     const cartHtml = await rc.text();
-    return {step: 'add', status: 200, pid: pid, confirmed: cartHtml.includes(pid)};
+    return {step: 'add', status: 200, pid: pid, name: name, confirmed: cartHtml.includes(pid)};
   } catch (e) {
     return {step: 'exception', error: String(e)};
   }
-})(arguments[0], arguments[1], arguments[2])
+})(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5])
 """
-            result = self.tab.run_js(js, var_url, add_url, quantity)
+            model = phone_model(self.target_name)
+            # 例: ('18','promax') -> 'iphone18promax'；('17','') -> 'iphone17'
+            # 套装（含 AirPods）商品名格式不确定，不比对机型名，只核对颜色/容量
+            want_model = f"iphone{model[0]}{model[1]}" if model and "airpods" not in self.target_name else ""
+            result = self.tab.run_js(js, var_url, add_url, quantity, self.target_color, self.target_storage, want_model, timeout=90)
             self.logger.info(f"API加购响应: {json.dumps(result, ensure_ascii=False)[:300]}")
             if not isinstance(result, dict):
                 return "fail"
@@ -1838,9 +1992,15 @@ return (async (varUrl, addUrl, qty) => {
             head = result.get("head") or ""
             if status == 429 or "<!DOCTYPE" in head or "Just a moment" in head:
                 return "cf_blocked"
+            if result.get("step") == "model_mismatch":
+                self.logger.error(f"❌ 站点返回机型 {result.get('name')} 与所选 {self.target_name} 不一致，不加购")
+                return "fail"
+            if result.get("step") == "mismatch":
+                self.logger.error(f"❌ 站点返回的规格与所选不一致，不加购: 所选 颜色={self.target_color} 内存={self.target_storage}，返回 {result.get('selected')} {result.get('name')}")
+                return "fail"
             if result.get("step") == "add" and status == 200:
                 if result.get("confirmed"):
-                    self.logger.info(f"✅ API加购成功: variant={result.get('pid')}, 数量={quantity}")
+                    self.logger.info(f"✅ API加购成功: {result.get('name')} variant={result.get('pid')}, 数量={quantity}")
                     return "ok"
                 if result.get("jsonError"):
                     self.logger.warning(f"⚠️ API加购返回错误: {result['jsonError']}")
@@ -1853,9 +2013,48 @@ return (async (varUrl, addUrl, qty) => {
             self.logger.warning(f"⚠️ API加购异常: {e}")
             return "fail"
 
+    def _add_pid_to_cart_via_api(self, pid, quantity):
+        """已知 variant pid 时直接 POST Cart-AddProduct"""
+        js = """
+return fetch(arguments[0], {
+    method: 'POST',
+    credentials: 'include',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest'},
+    body: new URLSearchParams({pid: arguments[1], quantity: arguments[2], options: '[]'}).toString()
+}).then(r => r.text().then(t => JSON.stringify({status: r.status, body: t})))
+  .catch(e => JSON.stringify({status: 0, body: String(e)}));
+"""
+        try:
+            # 网络慢时请求可能超过 30 秒，提前判失败会在请求仍在途时又走页面加购，造成重复加购
+            result = json.loads(self.tab.run_js(js, ADD_CART_API, pid, str(quantity), timeout=90))
+            status, body = result["status"], result["body"]
+            self.logger.info(f"API加购状态码: {status}, pid={pid}, 数量={quantity}")
+            head = body.lstrip()[:300]
+            if status == 429 or "Just a moment" in head or head.lower().startswith("<!doctype"):
+                return "cf_blocked"
+            if status != 200:
+                return "fail"
+            try:
+                data = json.loads(body)
+            except ValueError:
+                self.logger.warning(f"⚠️ API加购返回非 JSON: {head[:200]}")
+                return "fail"
+            if data.get("error"):
+                self.logger.warning(f"⚠️ API加购返回错误: {str(data.get('message') or data)[:200]}")
+                return "fail"
+            quota_msg = data.get("quotaErrMsgForPDP") or data.get("quotaPopUpMsg") or data.get("quotaRedirectUrl")
+            if quota_msg:
+                self.logger.warning(f"⚠️ API加购超出限购: {json.dumps(quota_msg, ensure_ascii=False)[:200]}")
+                return "fail"
+            self.logger.info(f"✅ API加购成功: variant={pid}, 数量={quantity}")
+            return "ok"
+        except Exception as e:
+            self.logger.warning(f"⚠️ API加购异常: {e}")
+            return "fail"
+
     def _submit_order_on_checkout_tab(self):
         """在预结账 tab 上点击提交订单按钮"""
-        self.logger.info("结账步骤3: 点击提交订单按钮......")
+        self.logger.info(f"结账步骤3: 在预结账页点提交订单。当前地址={getattr(self.new_tab, 'url', None)}")
         if self.new_tab is None:
             self.logger.error("❌ new_tab 为空，无法提交订单")
             return False
@@ -1874,14 +2073,18 @@ return (async (varUrl, addUrl, qty) => {
         if api_result == "ok":
             return self._submit_order_on_checkout_tab()
         elif api_result == "cf_blocked":
-            self.logger.warning("⚠️ API加购被Cloudflare拦截，刷新页面后回退到页面操作")
-            try:
-                self.tab.refresh()
-                time.sleep(3)
-            except Exception:
-                pass
+            self.logger.warning("⚠️ API加购被Cloudflare拦截")
+            if self._wait_user_pass_cf("API加购"):
+                api_result = self.add_to_cart_via_api(quantity=2)
+                if api_result == "ok":
+                    return self._submit_order_on_checkout_tab()
+            self.logger.warning("⚠️ 验证后 API 仍未加购成功，回退到页面操作")
         else:
             self.logger.warning("⚠️ API加购失败，回退到页面操作")
+        return self._add_to_cart_via_page_click()
+
+    def _add_to_cart_via_page_click(self, cf_retries=1):
+        """页面操作兜底：选颜色/内存、勾协议、点加入购物车，成功后提交订单。"""
         # ---- 以下为原页面操作兜底流程 ----
         color_option = self.tab.ele(f"tag:option@@data-id={self.target_color}")
         if color_option:
@@ -1936,6 +2139,10 @@ return (async (varUrl, addUrl, qty) => {
         # # 点击加入购物车按钮
         add_cart_option = self.tab.ele("tag:button@@class=add-to-cart btn btn-primary btn-block", timeout=0.5)
         if add_cart_option:
+            button_pid = add_cart_option.attr("data-pid") or ""
+            if button_pid.lower() != self._target_master().lower():
+                self.logger.error(f"❌ 加入购物车按钮属于 {button_pid}，不是所选商品 {self._target_master()}，不点击")
+                return False
             self.logger.info("✅ 找到加入购物车按钮1")
             self.tab.listen.start('on/demandware.store/Sites-hkt-hk-Site/zh_HK/Cart-AddProduct')
             # add_cart_option.click()
@@ -1954,16 +2161,26 @@ return (async (varUrl, addUrl, qty) => {
             input("请手动完成后续支付流程，完成后按任意键继续...")
         # time.sleep(6)
         # # 判断是否添加购物车成功
-        for packet in self.tab.listen.steps():
+        added = False
+        for packet in self.tab.listen.steps(timeout=15):
             status = packet.response.status
             print(status)
             if status == 200:
                 self.logger.info("✅ 加入购物车成功")
+                added = True
                 break
                 # return True
             else:
                 self.logger.error(f"❌ 加入购物车失败, 状态码: {status}")
+                if status in (403, 429) and cf_retries > 0:
+                    if self._wait_user_pass_cf(f"页面加购 {status}"):
+                        return self._add_to_cart_via_page_click(cf_retries=cf_retries - 1)
                 return False
+        if not added:
+            self.logger.error("❌ 点击加入购物车后 15 秒内没有收到加购响应")
+            if cf_retries > 0 and self._is_cf_challenge_page() and self._wait_user_pass_cf("页面加购无响应"):
+                return self._add_to_cart_via_page_click(cf_retries=cf_retries - 1)
+            return False
         
         # while True:
         #     goods_count = self.tab.ele("xpath://*[@id='navigation']/div[4]/div[1]/div/div/div[2]/div[2]/div/div[3]/div/div[1]/a/span[2]")
@@ -2006,29 +2223,129 @@ return (async (varUrl, addUrl, qty) => {
         #     except:
         #         return False
         return False
+    def _cart_item_names(self, tab):
+        js = """
+return fetch('/zh_HK/cart', {credentials: 'same-origin'}).then(r => r.text()).then(html => {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  return JSON.stringify([...doc.querySelectorAll('.line-item-name')].map(e => (e.textContent || '').trim()).filter(Boolean));
+}).catch(() => '[]');
+"""
+        try:
+            names = json.loads(tab.run_js(js, timeout=30))
+        except Exception as e:
+            self.logger.warning(f"读取购物车失败: {e}")
+            return None
+        return names if isinstance(names, list) else None
+
+    def _add_honor_via_api(self, tab, pid):
+        """页面按钮没把耳机加进去时，用站内加购接口补一次"""
+        js = """
+return fetch(arguments[0], {
+  method: 'POST', credentials: 'same-origin',
+  headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest'},
+  body: 'pid=' + encodeURIComponent(arguments[1]) + '&quantity=1&options=[]'
+}).then(r => r.text().then(t => JSON.stringify({status: r.status, head: t.slice(0, 120)})))
+  .catch(e => JSON.stringify({status: 0, head: String(e)}));
+"""
+        try:
+            result = json.loads(tab.run_js(js, ADD_CART_API, pid, timeout=30))
+        except Exception as e:
+            self.logger.warning(f"耳机接口加购异常: {e}")
+            return False
+        self.logger.info(f"耳机接口加购: {result}")
+        head = (result.get("head") or "")
+        return result.get("status") == 200 and "Just a moment" not in head and not head.lstrip().lower().startswith("<!doctype")
+
+    def _step(self, msg):
+        self.logger.info(f"【步骤】{msg}")
+
     def new_tab_and_add_little_goods_to_pay(self):
         goods_url = "https://eshop.hkcsl.com/zh_HK/HONOR/2474761scol.html"
+        honor_pid = "2474761scol"
+        self._step(f"1/6 打开耳机页 {goods_url}")
         new_tab = self.browser.new_tab(goods_url)
-        add_cart_button = new_tab.ele("xpath://*[@id='pdpContainer']/div[15]/div[2]/div/div/div[1]/button")
+        self._step(f"耳机页已打开 标题={new_tab.title!r} 地址={new_tab.url}")
+        try:
+            cookie_btn = new_tab.ele("css:#consent-tracking.show button.cookie-btn", timeout=3)
+            if cookie_btn:
+                cookie_btn.click()
+                self._step("已关闭耳机页 cookies 弹窗")
+        except Exception as e:
+            self.logger.info(f"耳机页没有 cookies 弹窗（{e}）")
+        # 只点本商品的加入购物车。旧的层级 xpath 在页面改版后会点到推荐商品，把页面带去别的手机
+        self._step(f"2/6 查找耳机加入购物车按钮 pid={honor_pid}")
+        how = f'button.add-to-cart[data-pid="{honor_pid}"]'
+        add_cart_button = new_tab.ele(f'css:button.add-to-cart[data-pid="{honor_pid}"]', timeout=8)
+        if not add_cart_button:
+            how = "button.add-to-cart"
+            add_cart_button = new_tab.ele("css:button.add-to-cart.btn.btn-primary", timeout=2)
+        if not add_cart_button:
+            how = "旧层级 xpath"
+            add_cart_button = new_tab.ele("xpath://*[@id='pdpContainer']/div[15]/div[2]/div/div/div[1]/button", timeout=2)
+            pid = ""
+            try:
+                pid = add_cart_button.attr("data-pid") or "" if add_cart_button else ""
+            except Exception:
+                pid = ""
+            if add_cart_button and pid and honor_pid not in pid:
+                self.logger.error(f"❌ 找到的按钮属于 {pid}，不是耳机 {honor_pid}，不点击")
+                add_cart_button = None
         if add_cart_button:
+            pid, text = "", ""
+            try:
+                pid = add_cart_button.attr("data-pid") or ""
+                text = (add_cart_button.text or "").strip().replace("\n", " ")[:40]
+            except Exception:
+                pass
+            self._step(f"点耳机加购 选择器={how} data-pid={pid or '无'} 按钮文字={text or '无'}")
             add_cart_button.click()
-            self.logger.info("✅ 已点击加入购物车按钮")
+            self.logger.info("✅ 已点击耳机加入购物车按钮")
         else:
-            self.logger.error("❌ 未找到加入购物车按钮")
-            return False
+            self.logger.warning(f"⚠️ 页面上没找到耳机加入购物车按钮（当前 {new_tab.url}），改用接口加购")
         time.sleep(2)
-        new_tab.get("https://eshop.hkcsl.com/zh_HK/cart")
-        jz_button = new_tab.ele("xpath://*[@id='maincontent']/div[3]/div/div[2]/div[1]/div[2]/div/div[1]/a")
-        if jz_button:
-            jz_button.click()
-            self.logger.info("✅ 已点击结账按钮")
-        else:
-            self.logger.error("❌ 未找到结账按钮")
+        self._step("3/6 读取购物车，确认耳机是否加进去")
+        names = self._cart_item_names(new_tab)
+        self.logger.info(f"加耳机后购物车: {names}")
+        if names is None or not any("HONOR" in n.upper() or "耳机" in n or "耳筒" in n for n in names):
+            self._step("购物车里没有耳机，改走站内加购接口")
+            self.logger.warning("⚠️ 购物车里没有耳机，用接口再加一次")
+            if not self._add_honor_via_api(new_tab, honor_pid):
+                self.logger.error("❌ 耳机没有加入购物车，停止。不再继续点结账，避免点到推荐商品")
+                return False
+            time.sleep(1)
+            names = self._cart_item_names(new_tab)
+            self.logger.info(f"接口加购后购物车: {names}")
+            if not names or not any("HONOR" in n.upper() or "耳机" in n or "耳筒" in n for n in names):
+                self.logger.error("❌ 接口加购后购物车仍没有耳机，停止")
+                return False
+        self._step(f"4/6 打开购物车 {CART_URL}")
+        new_tab.get(CART_URL)
+        self._step(f"购物车页已打开 地址={new_tab.url}")
+        jz_button = new_tab.ele("css:a.checkout-btn", timeout=8) or new_tab.ele('css:a[href*="Checkout-Begin"]', timeout=2)
+        href = ""
+        try:
+            href = (jz_button.attr("href") or "") if jz_button else ""
+        except Exception:
+            href = ""
+        if not jz_button or "Checkout" not in href:
+            self.logger.error(f"❌ 没找到结账链接（当前页 {new_tab.url}，候选地址 {href or '无'}）")
             return False
+        self._step(f"5/6 点击结账 链接={href}")
+        jz_button.click()
+        self.logger.info("✅ 已点击结账按钮")
+        self._step(f"结账已点击，等 10 秒让支付页出来。当前地址={new_tab.url}")
         time.sleep(10)
+        self._step(f"10 秒到了，当前地址={new_tab.url}")
         # 等待结账页进入支付阶段（支付按钮是后加载的，固定 sleep 可能不够）
         xyk_button = None
-        for _ in range(30):
+        for i in range(1, 31):
+            page_url = new_tab.url or ""
+            # 结账点偏、跑到商品页时立刻停，不再空等
+            if ".html" in page_url.split("?")[0] and "Checkout" not in page_url:
+                self.logger.error(f"❌ 结账后打开的是商品页而不是支付页: {page_url}")
+                return False
+            if i == 1 or i % 5 == 0:
+                self._step(f"6/6 等信用卡支付选项 {i}/30 当前地址={page_url}")
             # 优先用稳定的 id/class 选择器，旧的层级 xpath 作为兜底
             xyk_button = new_tab.ele("css:input#CARD", timeout=1) \
                 or new_tab.ele("css:.payment-methods-item.card-payment-id", timeout=1) \
@@ -2036,24 +2353,26 @@ return (async (varUrl, addUrl, qty) => {
             if xyk_button:
                 break
             # 还未到支付阶段则刷新等待
-            if "stage=payment" not in (new_tab.url or ""):
-                self.logger.info(f"等待支付页面加载中... 当前: {new_tab.url}")
+            if "stage=payment" not in page_url:
+                self.logger.info(f"等待支付页面加载中... 当前: {page_url}")
             time.sleep(1)
         if xyk_button:
             xyk_button.click()
-            self.logger.info("✅ 已点击信用卡支付方式按钮...")
+            self.logger.info(f"✅ 已点击信用卡支付方式按钮 地址={new_tab.url}")
         else:
-            self.logger.error(f"❌ 未找到信用卡支付方式按钮元素，当前URL: {new_tab.url}")
+            self.logger.error(f"❌ 30 次都没找到信用卡支付按钮，停在 {new_tab.url}")
             return False
+        self._step("已选信用卡，等 5 秒再勾同意条款")
         time.sleep(5)
-        xy_button = new_tab.ele("xpath://*[@id='agreeterms']")
+        xy_button = new_tab.ele("xpath://*[@id='agreeterms']", timeout=10)
         if xy_button:
             xy_button.click()
-            self.logger.info("✅ 已点击同意条款按钮...")
+            self.logger.info(f"✅ 已点击同意条款按钮 地址={new_tab.url}")
         else:
-            self.logger.error("❌ 未找到同意条款按钮元素")
+            self.logger.error(f"❌ 未找到同意条款按钮，当前地址={new_tab.url}")
             return False
         time.sleep(2)
+        self._step(f"预结账完成，停在提交订单前 地址={new_tab.url}")
         return new_tab
     def run(self):
         """运行抢购流程"""
@@ -2086,6 +2405,11 @@ return (async (varUrl, addUrl, qty) => {
                     time.sleep(2)
             # 登录页刚跳转完，等待稳定
             time.sleep(2)
+            if not self.scavenge_mode:
+                self._step(f"登录完成。抢购目标: {goods_options[self.goods_choice]['name']} ({self._target_master()}), 颜色={self.target_color}, 内存={self.target_storage}")
+                if not self._check_cart_before_rush():
+                    return
+            self._step("登录页检查完购物车，开始第二个页面：加耳机并预结账")
             self.new_tab = self.new_tab_and_add_little_goods_to_pay()
             if not self.new_tab:
                 self.logger.error("❌ 准备支付流程失败（new_tab 为空），终止运行")
@@ -2110,8 +2434,9 @@ return (async (varUrl, addUrl, qty) => {
             check_num = 0
             while True:
                 try:
-                    if "zh_HK/home" in self.tab.url:
-                        self.tab.get(TARGET_URL)
+                    if not self._on_target_page():
+                        self.logger.warning(f"⚠️ 当前页面不是所选商品，重新打开: {self.target_url}（当前: {self.tab.url}）")
+                        self.tab.get(self.target_url)
                         time.sleep(2)
                         continue
                     check_num += 1
@@ -2126,10 +2451,12 @@ return (async (varUrl, addUrl, qty) => {
                             self.logger.info("🎉 抢购成功！请手动完成后续支付流程。")
                             try:
                                 is_payment_page = False
-                                for _ in range(10):
-                                    if "https://onepayment.pccw.com/ecom/web/v2/pay?p=" in self.new_tab.url:
+                                for i in range(1, 11):
+                                    cur = self.new_tab.url or ""
+                                    if "https://onepayment.pccw.com/ecom/web/v2/pay?p=" in cur:
                                         is_payment_page = True
                                         break
+                                    self._step(f"等支付页跳转 {i}/10 当前地址={cur}")
                                     time.sleep(1)
                         
                                 if is_payment_page:
@@ -2159,11 +2486,10 @@ return (async (varUrl, addUrl, qty) => {
                                     self.logger.info("开始发送通知邮件")
                                     ok_content_str = json.dumps(ok_content, ensure_ascii=False, indent=2)
                                     print(ok_content_str)
-                                    # 发送订购成功邮件通知
-                                    send_email(to_email='k2049@qq.com', subject="抢购成功通知", content=ok_content_str)
-                                    send_email(to_email='leontang2010@gmail.com', subject="抢购成功通知", content=ok_content_str)
-                                    
-                                    self.logger.info("通知邮件发送完成")
+                                    if send_success_emails("抢购成功通知", ok_content_str):
+                                        self.logger.info("通知邮件全部发送成功")
+                                    else:
+                                        self.logger.error("通知邮件有收件人最终仍失败，请查看上方日志")
                             except Exception as e:
                                 self.logger.error(f"❌ 检测支付页面状态时发生异常: {e}")
                                 self.logger.error(traceback.format_exc())
@@ -2231,6 +2557,8 @@ def main():
     global TARGET_URL
     global is_in_coding
 
+    logging.info(f"版本 {VERSION}")
+    print(f"版本 {VERSION}")
     if not verify_auth():
         input("初始化不成功，按任意键退出...")
         return
@@ -2238,7 +2566,7 @@ def main():
     interval_label = "0秒(无间隔)" if CHECK_INTERVAL <= 0 else f"{CHECK_INTERVAL}秒"
     print(f"""
     ╔═══════════════════════════════════════╗
-    ║     多线程网站抢购助手 v2.0          ║
+    ║     多线程网站抢购助手 {VERSION}        ║
     ║     使用 DrissionPage 驱动           ║
     ║                                       ║
     ║  目标: 香港CSL手机抢购                ║
@@ -2306,7 +2634,7 @@ def main():
 
     # ---- 是否使用代理IP ----
     proxy_str = ""
-    loaded_proxy = load_proxy('proxy.txt')
+    loaded_proxy = load_proxy(os.path.join(APP_DIR, 'proxy.txt'))
     if loaded_proxy:
         print(f"\n检测到代理配置: {loaded_proxy.split(':')[0]}:{loaded_proxy.split(':')[1]}")
         print("是否使用代理IP？")
@@ -2341,7 +2669,7 @@ def main():
         print("已取消")
         return
 
-    accounts = load_accounts('account.txt')
+    accounts = load_accounts(os.path.join(APP_DIR, 'account.txt'))
     if not accounts:
         print("错误：未能加载任何账号，请检查 account.txt 文件")
         return

@@ -1,0 +1,48 @@
+# CSL 抢购系统配置文件示例
+# 复制此文件为 config.yaml 并填写真实账号信息
+
+# 监控服务器配置
+server:
+  port: 8080
+  check_interval_ms: 500  # 库存检查间隔（毫秒）
+
+# 商品配置
+product:
+  name: "iPhone 17 Pro Max"
+  url: "https://eshop.hkcsl.com/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Product-Variation"
+  pid: "IP17_promaxscol"
+
+  # 颜色代码
+  # iPhone 17 Pro/Pro Max:
+  #   927 = 银色
+  #   31033 = 宇宙橙色
+  #   31034 = 深墨蓝色
+  # iPhone 17:
+  #   25 = 黑色
+  #   962 = 白色
+  #   16827 = 蓝色
+  #   15121 = 薰衣草紫色
+  #   31032 = 鼠尾草绿色
+  color: "927"
+
+  # 内存代码
+  #   1025 = 256GB
+  #   1026 = 512GB
+  #   1027 = 1TB
+  #   4697 = 2TB
+  storage: "1026"
+
+# 账号配置（支持多账号并发抢购）
+accounts:
+  - username: "account1@example.com"
+    password: "password1"
+  - username: "account2@example.com"
+    password: "password2"
+  - username: "account3@example.com"
+    password: "password3"
+
+# 终端客户端配置
+client:
+  server_url: "ws://localhost:8080/ws"
+  headless: false  # 登录时是否使用无头浏览器（false 可看到登录过程）
+  purchase_quantity: 2  # 每次购买数量

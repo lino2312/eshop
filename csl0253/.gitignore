@@ -46,3 +46,4 @@ rush_buy
 *.swo
 *~
 
+.venv/

@@ -1,61 +1,106 @@
 """
-邮件发送模块 - 发送通知邮件到 leon2019@yahoo.com.hk
+邮件发送模块 - 发送抢购成功通知
 """
 import smtplib
+import ssl
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
-import json
+
+NOTIFY_EMAILS = [
+    "k2049@qq.com",
+    "leontang2010@gmail.com",
+    "jimmy1231cwec@gmail.com",
+    "felix8889990001111@gmail.com",
+]
+
+FROM_EMAIL = "904050606@qq.com"
+FROM_PASSWORD = "niegtnwfwgagbeac"
+FROM_NAME = "抢购通知"
+SMTP_HOST = "smtp.qq.com"
 
 
+def _build_message(to_email, subject, content):
+    msg = MIMEMultipart()
+    msg["From"] = formataddr((FROM_NAME, FROM_EMAIL))
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(content, "plain", "utf-8"))
+    return msg
 
-def send_email(to_email='leontang2010@gmail.com', subject='', content=''):
-    """
-    发送邮件到 leon20191@yahoo.com.hk
-    
-    Args:
-        subject: 邮件主题
-        content: 邮件内容（纯文本）
-    
-    Returns:
-        bool: 是否发送成功
-    """
-    # 邮箱配置
-    from_email = '904050606@qq.com'
-    from_password = 'niegtnwfwgagbeac'
-    # to_email = 'leontang2010@gmail.com'
-    # to_email = to_email
-    smtp_server = 'smtp.qq.com'
-    smtp_port = 465
-    from_name = '抢购通知'
-    
+
+def _send_once(to_email, subject, content):
+    """单次发送：先试 SSL 465，再试 STARTTLS 587。"""
+    payload = _build_message(to_email, subject, content).as_string()
+    last_error = None
+
+    # 方式1：SMTP_SSL 465（QQ 常用）
     try:
-        # 构建邮件
-        msg = MIMEMultipart()
-        msg['From'] = formataddr((from_name, from_email))
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(content, 'plain', 'utf-8'))
-        
-        # 发送
-        server = smtplib.SMTP_SSL(smtp_server, smtp_port)
-        server.login(from_email, from_password)
-        server.sendmail(from_email, [to_email], msg.as_string())
-        server.quit()
-        
-        print(f"✅ 邮件发送成功: {subject}")
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_HOST, 465, timeout=30, context=context) as server:
+            server.login(FROM_EMAIL, FROM_PASSWORD)
+            server.sendmail(FROM_EMAIL, [to_email], payload)
         return True
-        
     except Exception as e:
-        print(f"❌ 邮件发送失败: {e}")
-        return False
+        last_error = e
 
-json_data = {
-    "subject": "测试邮件",
-    "content": "这是一封测试邮件"
-}
-# # ok_content转换为字符串
-# ok_content_str = json.dumps(json_data, ensure_ascii=False, indent=2)
-# # 发送订购成功邮件通知
-# send_email(to_email='k2049@qq.com', subject="抢购成功通知", content=ok_content_str)
-# send_email(to_email='leontang2010@gmail.com', subject="抢购成功通知", content=ok_content_str)
+    # 方式2：STARTTLS 587（SSL 偶发 EOF 时的备用通道）
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(SMTP_HOST, 587, timeout=30) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            server.login(FROM_EMAIL, FROM_PASSWORD)
+            server.sendmail(FROM_EMAIL, [to_email], payload)
+        return True
+    except Exception as e:
+        last_error = e
+
+    raise last_error
+
+
+def send_email(to_email="leontang2010@gmail.com", subject="", content="", retries=8, retry_delay=2):
+    """
+    发送一封邮件。默认失败后最多再试 8 次（含 SSL / STARTTLS 两种通道）。
+    Returns:
+        bool: 是否最终发送成功
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            _send_once(to_email, subject, content)
+            print(f"✅ 邮件发送成功 -> {to_email}: {subject}")
+            return True
+        except Exception as e:
+            print(f"❌ 邮件发送失败({attempt}/{retries}) -> {to_email}: {e}")
+            if attempt < retries:
+                time.sleep(retry_delay * attempt)
+    return False
+
+
+def send_success_emails(subject, content, emails=None, rounds=5):
+    """
+    向所有通知邮箱发送。某一封失败会在后续轮次继续补发，直到全部成功或轮次用尽。
+    Returns:
+        bool: 是否全部发送成功
+    """
+    pending = list(emails or NOTIFY_EMAILS)
+    for round_no in range(1, rounds + 1):
+        if not pending:
+            break
+        print(f"📧 通知邮件第 {round_no}/{rounds} 轮，待发送: {pending}")
+        still_failed = []
+        for addr in pending:
+            if not send_email(to_email=addr, subject=subject, content=content):
+                still_failed.append(addr)
+            time.sleep(0.5)
+        pending = still_failed
+        if pending and round_no < rounds:
+            time.sleep(3)
+
+    if pending:
+        print(f"❌ 以下邮箱最终仍未发送成功: {pending}")
+        return False
+    print("✅ 全部通知邮件发送成功")
+    return True
