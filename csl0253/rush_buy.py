@@ -43,12 +43,14 @@ logging.basicConfig(
     ]
 )
 
-VERSION = "V2.0.2"
+VERSION = "V2.0.3"
 TARGET_URL = ""
 LOGIN_URL = "https://eshop.hkcsl.com/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Login-Show"
 CHECKOUT_URL = "https://eshop.hkcsl.com/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Checkout-Begin?stage=payment"
 CART_URL = "https://eshop.hkcsl.com/zh_HK/cart"
-CHECK_INTERVAL = 1.5
+# 库存检查速度：每多少秒检查 10 次。启动时会询问，直接回车就用这个默认值。
+# 之前的版本大约 13 秒检查 10 次；V2.0.2 及之前的几个包因为多等了 1.5 秒变成约 30 秒。
+CHECK_10_SECONDS = 13.0
 VERBOSE_STOCK_LOG = False
 FAST_ACTION_DELAY = 0.05
 FAST_POST_CLICK_DELAY = 0.1
@@ -2426,10 +2428,11 @@ return fetch(arguments[0], {
                 self.logger.error("无法导航到商品页面，终止运行")
                 return
 
-            interval_label = "无间隔" if CHECK_INTERVAL <= 0 else f"{CHECK_INTERVAL}秒"
-            self.logger.info(f"开始监控库存，检查间隔: {interval_label}...")
-            
-            
+            pacer = CheckPacer(CHECK_10_SECONDS)
+            self.logger.info(
+                f"开始监控库存，设定每 {pacer.seconds_per_10:g} 秒检查10次（每次间隔 {pacer.period:.2f} 秒）..."
+            )
+
             goods = {"name": goods_options[self.goods_choice]["name"], "color": self.target_color, "rom": self.target_storage}
             check_num = 0
             while True:
@@ -2439,6 +2442,7 @@ return fetch(arguments[0], {
                         self.tab.get(self.target_url)
                         time.sleep(2)
                         continue
+                    pacer.begin()
                     check_num += 1
                     if check_num % 10 == 0:
                         print(f"🔍 第{check_num}次开始检查库存: {goods['name']}, 颜色: {goods['color']}, 内存: {goods['rom']}")
@@ -2503,17 +2507,18 @@ return fetch(arguments[0], {
                             self.tab.refresh()
                             time.sleep(FAST_RETRY_DELAY)
                     else:
-                        time.sleep(1)
+                        # 按设定的"每 N 秒检查10次"补足等待（已扣掉检查本身的耗时）
+                        pacer.wait()
                         if check_num % 10 == 0:
-                            self.logger.info(f"第{check_num}次当前库存不足08，继续监控...")
+                            used = pacer.batch_seconds()
+                            self.logger.info(
+                                f"第{check_num}次当前库存不足08，继续监控..."
+                                f"（最近10次用时 {used:.1f} 秒，设定 {pacer.seconds_per_10:g} 秒）"
+                            )
                         if time.time() - last_refresh_time > 8 * 60:
                             self.tab.refresh()
                             last_refresh_time = time.time()
                             self.logger.info("刷新页面")
-                    if CHECK_INTERVAL > 0:
-                        time.sleep(CHECK_INTERVAL)
-                    else:
-                        time.sleep(0)
                 except Exception as loop_e:
                     err_msg = str(loop_e).strip()
                     self.logger.warning(f"监控循环出现异常(忽略继续): {err_msg}")
@@ -2533,6 +2538,68 @@ return fetch(arguments[0], {
             if self.browser:
                 self.logger.info("保持浏览器打开，请手动关闭...")
             self.cleanup()
+
+
+class CheckPacer:
+    """
+    按"每 N 秒检查 10 次"控制库存检查的节奏。
+    每次检查从开始到下一次开始固定为 N/10 秒；检查本身耗时会被扣掉，
+    所以实际速度不受网络快慢影响。检查本身就超过 N/10 秒时不再额外等待。
+    """
+
+    def __init__(self, seconds_per_10):
+        self.seconds_per_10 = max(0.0, float(seconds_per_10))
+        self.period = self.seconds_per_10 / 10.0
+        self._check_start = None
+        self._batch_start = None
+
+    def begin(self):
+        """一次检查开始时调用。"""
+        self._check_start = time.time()
+        if self._batch_start is None:
+            self._batch_start = self._check_start
+
+    def wait(self):
+        """一次检查结束后调用：补足到 N/10 秒。"""
+        if self._check_start is None:
+            return
+        remain = self._check_start + self.period - time.time()
+        if remain > 0:
+            time.sleep(remain)
+
+    def batch_seconds(self):
+        """返回这一批（10 次）实际用了多少秒，并开始下一批计时。"""
+        if self._batch_start is None:
+            return 0.0
+        used = time.time() - self._batch_start
+        self._batch_start = None
+        return used
+
+
+def parse_check_10_seconds(text, default=None):
+    """把输入解析成"每多少秒检查10次"。空输入用默认值；不是数字或小于0返回 None。"""
+    if default is None:
+        default = CHECK_10_SECONDS
+    text = (text or "").strip()
+    if not text:
+        return float(default)
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value < 0 or value != value or value == float("inf"):
+        return None
+    return value
+
+
+def ask_check_10_seconds():
+    """启动时询问库存检查速度，输入无效就重新问。"""
+    while True:
+        raw = input(f"请输入每多少秒检查10次库存 (直接回车默认 {CHECK_10_SECONDS:g} 秒): ")
+        value = parse_check_10_seconds(raw)
+        if value is not None:
+            return value
+        print("错误：请输入不小于 0 的数字，例如 13")
 
 
 def load_accounts(filename='account.txt'):
@@ -2556,6 +2623,7 @@ def main():
     """主函数"""
     global TARGET_URL
     global is_in_coding
+    global CHECK_10_SECONDS
 
     logging.info(f"版本 {VERSION}")
     print(f"版本 {VERSION}")
@@ -2563,14 +2631,12 @@ def main():
         input("初始化不成功，按任意键退出...")
         return
 
-    interval_label = "0秒(无间隔)" if CHECK_INTERVAL <= 0 else f"{CHECK_INTERVAL}秒"
     print(f"""
     ╔═══════════════════════════════════════╗
     ║     多线程网站抢购助手 {VERSION}        ║
     ║     使用 DrissionPage 驱动           ║
     ║                                       ║
     ║  目标: 香港CSL手机抢购                ║
-    ║  检查间隔: {interval_label:<23}║
     ╚═══════════════════════════════════════╝
     """)
     print("是否在测试模式：")
@@ -2632,6 +2698,10 @@ def main():
         selected_storage = STORAGE_OPTIONS[storage_choice]
         print(f"✓ 已选择内存: {selected_storage['name']}")
 
+        print("\n库存检查速度（数字越小检查越快，也越容易触发人机验证）:")
+        CHECK_10_SECONDS = ask_check_10_seconds()
+        print(f"✓ 已设定: 每 {CHECK_10_SECONDS:g} 秒检查10次库存（每次间隔 {CHECK_10_SECONDS / 10:.2f} 秒）")
+
     # ---- 是否使用代理IP ----
     proxy_str = ""
     loaded_proxy = load_proxy(os.path.join(APP_DIR, 'proxy.txt'))
@@ -2662,6 +2732,7 @@ def main():
         print(f"  商品URL: {TARGET_URL}")
         print(f"  目标颜色: {selected_color['name']}")
         print(f"  目标内存: {selected_storage['name']}")
+        print(f"  检查速度: 每 {CHECK_10_SECONDS:g} 秒检查10次库存")
     print("="*50)
 
     confirm = input("\n确认开始抢购? (y/n): ").strip().lower()

@@ -2,7 +2,6 @@
 邮件发送模块 - 发送抢购成功通知
 """
 import smtplib
-import ssl
 import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -19,6 +18,7 @@ FROM_EMAIL = "904050606@qq.com"
 FROM_PASSWORD = "niegtnwfwgagbeac"
 FROM_NAME = "抢购通知"
 SMTP_HOST = "smtp.qq.com"
+SMTP_PORT = 465
 
 
 def _build_message(to_email, subject, content):
@@ -41,50 +41,26 @@ def _close_quietly(server):
             pass
 
 
-def _deliver(server, to_email, payload):
-    server.login(FROM_EMAIL, FROM_PASSWORD)
-    server.sendmail(FROM_EMAIL, [to_email], payload)
-    _close_quietly(server)
-
-
 def _send_once(to_email, subject, content):
-    """单次发送：先试 SSL 465，只有这封还没被服务器收下才再试 STARTTLS 587。"""
-    payload = _build_message(to_email, subject, content).as_string()
-    last_error = None
-
-    # 方式1：SMTP_SSL 465（QQ 常用）
-    server = None
+    """
+    单次发送，写法与最初版本一致：SMTP_SSL 465 -> login -> sendmail -> quit。
+    不传 context（和最初版本一样不校验证书），所以不依赖对方电脑上有没有根证书。
+    """
+    msg = _build_message(to_email, subject, content)
+    server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
     try:
-        context = ssl.create_default_context()
-        server = smtplib.SMTP_SSL(SMTP_HOST, 465, timeout=30, context=context)
-        _deliver(server, to_email, payload)
-        return True
-    except Exception as e:
-        last_error = e
-        if server is not None:
-            _close_quietly(server)
-
-    # 方式2：STARTTLS 587。只在 465 没把信交出去时才走，避免同一封发两次
-    server = None
-    try:
-        context = ssl.create_default_context()
-        server = smtplib.SMTP(SMTP_HOST, 587, timeout=30)
-        server.ehlo()
-        server.starttls(context=context)
-        server.ehlo()
-        _deliver(server, to_email, payload)
-        return True
-    except Exception as e:
-        last_error = e
-        if server is not None:
-            _close_quietly(server)
-
-    raise last_error
+        server.login(FROM_EMAIL, FROM_PASSWORD)
+        server.sendmail(FROM_EMAIL, [to_email], msg.as_string())
+    except Exception:
+        _close_quietly(server)
+        raise
+    _close_quietly(server)
+    return True
 
 
 def send_email(to_email="leontang2010@gmail.com", subject="", content="", retries=8, retry_delay=2):
     """
-    发送一封邮件。默认失败后最多再试 8 次（含 SSL / STARTTLS 两种通道）。
+    发送一封邮件。失败后重试，默认最多试 8 次。
     Returns:
         bool: 是否最终发送成功
     """
