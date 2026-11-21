@@ -41,21 +41,40 @@ def _close_quietly(server):
             pass
 
 
+class MailAccepted(Exception):
+    """信很可能已经被服务器收下了（常见于 QQ 发完后立刻断开），不能再重发。"""
+
+
+def _looks_like_accepted_disconnect(exc):
+    if isinstance(exc, smtplib.SMTPServerDisconnected):
+        return True
+    msg = str(exc).lower()
+    return "connection unexpectedly closed" in msg or "please run connect()" in msg
+
+
 def _send_once(to_email, subject, content):
     """
     单次发送，写法与最初版本一致：SMTP_SSL 465 -> login -> sendmail -> quit。
     不传 context（和最初版本一样不校验证书），所以不依赖对方电脑上有没有根证书。
     """
     msg = _build_message(to_email, subject, content)
-    server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
+    server = None
+    step = "连接"
     try:
+        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
+        step = "登录"
         server.login(FROM_EMAIL, FROM_PASSWORD)
+        step = "发信"
         server.sendmail(FROM_EMAIL, [to_email], msg.as_string())
-    except Exception:
+        step = "关闭"
         _close_quietly(server)
+        return True
+    except Exception as e:
+        if server is not None:
+            _close_quietly(server)
+        if step in ("发信", "关闭") and _looks_like_accepted_disconnect(e):
+            raise MailAccepted(f"{step}时连接断开（邮件可能已发出，不再重试）: {e}") from e
         raise
-    _close_quietly(server)
-    return True
 
 
 def send_email(to_email="leontang2010@gmail.com", subject="", content="", retries=8, retry_delay=2):
@@ -68,6 +87,9 @@ def send_email(to_email="leontang2010@gmail.com", subject="", content="", retrie
         try:
             _send_once(to_email, subject, content)
             print(f"✅ 邮件发送成功 -> {to_email}: {subject}")
+            return True
+        except MailAccepted as e:
+            print(f"✅ 邮件按已发送处理 -> {to_email}: {e}")
             return True
         except Exception as e:
             print(f"❌ 邮件发送失败({attempt}/{retries}) -> {to_email}: {e}")
