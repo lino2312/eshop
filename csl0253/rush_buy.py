@@ -43,7 +43,7 @@ logging.basicConfig(
     ]
 )
 
-VERSION = "V2.0.3"
+VERSION = "V2.0.4"
 TARGET_URL = ""
 LOGIN_URL = "https://eshop.hkcsl.com/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Login-Show"
 CHECKOUT_URL = "https://eshop.hkcsl.com/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Checkout-Begin?stage=payment"
@@ -434,6 +434,16 @@ class RushBuyBot:
         self.is_pro_model = False
         self.goods_choice = goods_choice
         self.new_tab = None
+        # 开始监控前从站点查好的型号编号（所选颜色+内存），有货后直接加车
+        self.variant_pid = None
+        self.variant_name = None
+        # 查库存：第一次走页面（学到站点真实参数名），之后直接请求接口
+        self._direct_check_ready = False
+        self._direct_check_fails = 0
+        self._direct_check_off_until = 0
+        # 加车被 Cloudflare 拦截后的退避：连续被拦次数、下一次允许加车的时间
+        self._add_block_streak = 0
+        self._add_retry_at = 0
         # 选购结果绑在实例上，加购/导航一律用这里的值，不依赖全局 TARGET_URL
         if not scavenge_mode and goods_choice in goods_options:
             self.target_url = goods_options[goods_choice]["url"]
@@ -580,25 +590,56 @@ class RushBuyBot:
             title = ""
         return "just a moment" in title or "請稍候" in title or "请稍候" in title
 
-    def _wait_user_pass_cf(self, reason="请求被拦截", timeout=180):
-        """加购等请求被 Cloudflare 拦住时，提醒人在浏览器里点验证，通过后继续。不自动破解验证。"""
-        self.logger.warning(f"⚠️ Cloudflare 拦截（{reason}），请到机器人浏览器窗口点击验证")
-        print("\n" + "=" * 56)
-        print("⚠️ 被 Cloudflare 拦截了！")
-        print("请到机器人打开的 Chrome 窗口里，点击 Just a moment / 验证")
-        print(f"通过后程序会自动继续（最长等 {timeout} 秒）")
-        print("=" * 56 + "\n")
+    def _product_page_ready(self):
+        """商品页是否真的加载出来了（能找到所选颜色的选项），而不是验证页或空白页。"""
+        try:
+            if not self._on_target_page():
+                return False
+            return bool(self.tab.ele(f"tag:option@@data-id={self.target_color}", timeout=0.3))
+        except Exception:
+            return False
+
+    def _reload_and_detect_challenge(self, wait=8):
+        """
+        重新打开商品页，看 Cloudflare 有没有真的弹出验证页。
+        返回 True=页面上是验证页；False=商品页正常加载出来了（没有验证可点）。
+        浏览器是"不等加载完成"模式，所以这里必须自己等页面真的出来再判断。
+        """
         try:
             if not self._is_cf_challenge_page():
                 self.tab.get(self.target_url)
         except Exception:
             pass
+        time.sleep(1.5)
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            if self._is_cf_challenge_page():
+                return True
+            if self._product_page_ready():
+                return False
+            time.sleep(0.5)
+        return self._is_cf_challenge_page()
+
+    def _wait_user_pass_cf(self, reason="请求被拦截", timeout=180):
+        """
+        加购等请求被 Cloudflare 拦住时：重新打开商品页，页面上真的有验证才提醒人去点，通过后返回 True。
+        页面上没有验证（只是加车接口被限流）或等待超时返回 False。不自动破解验证。
+        """
+        self.logger.warning(f"⚠️ Cloudflare 拦截（{reason}），重新打开商品页检查有没有验证框")
+        if not self._reload_and_detect_challenge():
+            self.logger.warning("⚠️ 商品页正常打开，没有出现验证框：被拦的只是「加入购物车」请求（限流），没有验证可点")
+            return False
+        print("\n" + "=" * 56)
+        print("⚠️ 被 Cloudflare 拦截了！")
+        print("请到机器人打开的 Chrome 窗口里，点击 Just a moment / 验证")
+        print(f"通过后程序会自动继续（最长等 {timeout} 秒）")
+        print("=" * 56 + "\n")
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if not self._is_cf_challenge_page() and self._on_target_page():
-                self.logger.info("✅ Cloudflare 验证已通过，继续抢购")
+            if not self._is_cf_challenge_page() and self._product_page_ready():
+                self.logger.info("✅ Cloudflare 验证已通过，商品页已加载，继续抢购")
                 return True
-            time.sleep(2)
+            time.sleep(1)
         self.logger.error("❌ 等待 Cloudflare 验证超时")
         return False
 
@@ -1906,6 +1947,102 @@ return fetch('/zh_HK/cart', {credentials: 'include'}).then(r => r.text()).then(h
         self.logger.warning(f"⚠️ {name}未定位到勾选框，已点击label，未校验状态")
         return True
 
+    def _variation_url(self):
+        """
+        带所选颜色+内存的 Product-Variation 地址。
+        参数名优先用查库存时从页面真实请求里抓到的（各机型的 dwvar_ 参数名不完全一样），
+        还没抓到时按 pid 推算。返回 (地址, 是否用了页面抓到的参数名)。
+        """
+        from urllib.parse import urlencode, urlparse, parse_qsl
+        from csl_test import check_stock_selenium as css
+        master_pid = self._target_master()
+        # 站点的 dwvar_ 参数名里，pid 中的下划线写成双下划线（IP18_promaxscol -> IP18__promaxscol）
+        dw_key = master_pid.replace("_", "__")
+        color_key = f"dwvar_{dw_key}_color"
+        rom_key = f"dwvar_{dw_key}_internal_storage_rom"
+        params = {"pid": master_pid, "quantity": 1, "source": "ajax", "offerPriceId": "online-price"}
+        learned = False
+        captured = dict(parse_qsl(urlparse(css.LAST_VARIATION_URL or "").query, keep_blank_values=True))
+        real_color_key = next((k for k in captured if k.startswith("dwvar_") and k.endswith("_color")), None)
+        if real_color_key:
+            params = captured
+            color_key = real_color_key
+            rom_key = next((k for k in captured if k.startswith("dwvar_") and k.endswith("_internal_storage_rom")),
+                           real_color_key[:-len("_color")] + "_internal_storage_rom")
+            learned = True
+        params[color_key] = self.target_color
+        params[rom_key] = self.target_storage
+        return "/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Product-Variation?" + urlencode(params), learned
+
+    def _check_stock_direct(self):
+        """
+        直接请求 Product-Variation 查库存（不动页面上的下拉框）。
+        判断标准和页面方式一样：所选内存在返回里的 selectable。
+        返回 (结果, 原始返回)。结果为 True/False；请求异常、被拦、返回的规格和所选对不上时为 None
+        （由调用方退回页面方式）。
+        """
+        var_url, _ = self._variation_url()
+        js = """
+return (async (varUrl, wantRom) => {
+  try {
+    const r = await fetch(varUrl, {headers: {'X-Requested-With': 'XMLHttpRequest'}, credentials: 'same-origin', cache: 'no-store'});
+    if (r.status !== 200) return {ok: false, status: r.status};
+    const d = await r.json();
+    const p = d.product || {};
+    const attrs = p.variationAttributes || [];
+    const selected = {};
+    for (const attr of attrs) {
+      const v = (attr.values || []).find(x => x.selected);
+      selected[attr.attributeId || attr.id] = v ? String(v.id) : null;
+    }
+    const romAttr = attrs.find(a => (a.attributeId || a.id) === 'internal_storage_rom') || attrs[1];
+    const rom = romAttr && (romAttr.values || []).find(x => String(x.id) === String(wantRom));
+    return {ok: true, found: !!rom, selectable: rom ? !!rom.selectable : false,
+            pid: p.id, name: p.productName, selected: selected};
+  } catch (e) {
+    return {ok: false, error: String(e)};
+  }
+})(arguments[0], arguments[1])
+"""
+        try:
+            res = self.tab.run_js(js, var_url, self.target_storage, timeout=15)
+        except Exception as e:
+            res = {"ok": False, "error": str(e)}
+        if not isinstance(res, dict) or not res.get("ok"):
+            return None, res
+        # 和页面查库存一样：找到所选内存就按它的 selectable 判断。
+        # 有的机型（如 Pro Max）返回里 selected 为空，不能当成请求失败。
+        if not res.get("found"):
+            return None, res
+        return bool(res.get("selectable")), res
+
+    def check_stock_once(self, goods):
+        """
+        查一次库存，返回是否有货。
+        第一次用页面方式（顺便抓到站点真实的参数名），之后直接请求接口，更快也不受页面状态影响。
+        直接请求出问题时这一次退回页面方式；连续 3 次出问题就停用 60 秒。
+        """
+        from csl_test import check_stock_selenium as css
+        if not self._direct_check_ready:
+            in_stock = check_stock_with_selenium2(self.tab, goods)
+            if css.LAST_VARIATION_URL:
+                self._direct_check_ready = True
+                if not self.variant_pid:
+                    self.prefetch_variant(attempts=1)
+            return in_stock
+        if time.time() < self._direct_check_off_until:
+            return check_stock_with_selenium2(self.tab, goods)
+        in_stock, res = self._check_stock_direct()
+        if in_stock is None:
+            self._direct_check_fails += 1
+            if self._direct_check_fails >= 3:
+                self._direct_check_fails = 0
+                self._direct_check_off_until = time.time() + 60
+                self.logger.warning(f"⚠️ 直接查库存连续 3 次不正常，改回页面方式 60 秒: {json.dumps(res, ensure_ascii=False)[:200]}")
+            return check_stock_with_selenium2(self.tab, goods)
+        self._direct_check_fails = 0
+        return in_stock
+
     def add_to_cart_via_api(self, quantity=2):
         """
         有货后通过站内 AJAX 接口直接加购物车（跳过页面选择颜色/内存/勾选协议，省 3-5 秒）。
@@ -1916,19 +2053,7 @@ return fetch('/zh_HK/cart', {credentials: 'include'}).then(r => r.text()).then(h
         # 不再用本地 pid 表直通加购（表错/站点改版时会买错机型）。
         self._step(f"有货，开始 API 加购 数量={quantity} 颜色={self.target_color} 容量={self.target_storage} 页面={self.tab.url}")
         try:
-            from urllib.parse import urlencode, urlparse, parse_qsl
-            from csl_test import check_stock_selenium as css
-            master_pid = self._target_master()
-            # 站点的 dwvar_ 参数名里，pid 中的下划线写成双下划线（IP18_promaxscol -> IP18__promaxscol）
-            dw_key = master_pid.replace("_", "__")
-            params = {"pid": master_pid, "quantity": 1, "source": "ajax", "offerPriceId": "online-price"}
-            captured = css.LAST_VARIATION_URL or ""
-            captured_params = dict(parse_qsl(urlparse(captured).query))
-            if captured_params.get("pid") == master_pid:
-                params = captured_params
-            params[f"dwvar_{dw_key}_color"] = self.target_color
-            params[f"dwvar_{dw_key}_internal_storage_rom"] = self.target_storage
-            var_url = "/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Product-Variation?" + urlencode(params)
+            var_url, _ = self._variation_url()
             add_url = "/on/demandware.store/Sites-hkt-hk-Site/zh_HK/Cart-AddProduct"
             js = """
 return (async (varUrl, addUrl, qty, wantColor, wantRom, wantModel) => {
@@ -2015,6 +2140,60 @@ return (async (varUrl, addUrl, qty, wantColor, wantRom, wantModel) => {
             self.logger.warning(f"⚠️ API加购异常: {e}")
             return "fail"
 
+    def prefetch_variant(self, attempts=3):
+        """
+        开始监控前请求一次 Product-Variation（所选颜色+内存），拿到型号编号并核对机型/颜色/内存。
+        有货后就只需发一个 Cart-AddProduct 请求。查不到时返回 False，有货后走原来的两步加购。
+        """
+        var_url, learned = self._variation_url()
+        model = phone_model(self.target_name)
+        want_model = f"iphone{model[0]}{model[1]}" if model and "airpods" not in self.target_name else ""
+        js = """
+return (async (varUrl, wantColor, wantRom, wantModel) => {
+  try {
+    const r = await fetch(varUrl, {headers: {'X-Requested-With': 'XMLHttpRequest'}});
+    if (r.status !== 200) return {ok: false, status: r.status};
+    const d = await r.json();
+    const p = d.product || {};
+    if (!p.id || !p.productName) return {ok: false, error: 'no pid/name'};
+    const m = String(p.productName).toLowerCase().replace(/\\s+/g, '').match(/iphone(\\d+)(promax|pro|plus|air)?/);
+    const gotModel = m ? ('iphone' + m[1] + (m[2] || '')) : '';
+    const selected = {};
+    for (const attr of (p.variationAttributes || [])) {
+      const v = (attr.values || []).find(x => x.selected);
+      selected[attr.attributeId || attr.id] = v ? String(v.id) : null;
+    }
+    return {ok: true, pid: p.id, name: p.productName, gotModel: gotModel, selected: selected};
+  } catch (e) {
+    return {ok: false, error: String(e)};
+  }
+})(arguments[0], arguments[1], arguments[2], arguments[3])
+"""
+        for i in range(1, attempts + 1):
+            try:
+                result = self.tab.run_js(js, var_url, self.target_color, self.target_storage, want_model, timeout=30)
+            except Exception as e:
+                result = {"ok": False, "error": str(e)}
+            if isinstance(result, dict) and result.get("ok"):
+                sel = result.get("selected") or {}
+                if want_model and result.get("gotModel") != want_model:
+                    self.logger.error(f"❌ 预查型号: 站点返回机型 {result.get('name')} 与所选 {self.target_name} 不一致，不使用")
+                    return False
+                if sel.get("color") != str(self.target_color) or sel.get("internal_storage_rom") != str(self.target_storage):
+                    if learned:
+                        self.logger.error(f"❌ 预查型号: 站点返回规格 {sel} 与所选 颜色={self.target_color} 内存={self.target_storage} 不一致，不使用")
+                    else:
+                        self.logger.info(f"预查型号: 推算的参数名没对上（返回 {sel}），第一次查库存抓到真实参数名后再查一次")
+                    return False
+                self.variant_pid = result["pid"]
+                self.variant_name = result.get("name")
+                self._step(f"预查型号完成: {self.variant_name} 编号={self.variant_pid}，有货后直接加车")
+                return True
+            self.logger.warning(f"⚠️ 预查型号失败 {i}/{attempts}: {json.dumps(result, ensure_ascii=False)[:200]}")
+            time.sleep(1)
+        self.logger.warning("⚠️ 预查型号没成功，有货后改用两步加购（查型号+加车）")
+        return False
+
     def _add_pid_to_cart_via_api(self, pid, quantity):
         """已知 variant pid 时直接 POST Cart-AddProduct"""
         js = """
@@ -2060,30 +2239,60 @@ return fetch(arguments[0], {
         if self.new_tab is None:
             self.logger.error("❌ new_tab 为空，无法提交订单")
             return False
+        t0 = time.time()
         submit_button = self.new_tab.ele('xpath://*[@id="place-order"]', timeout=5)
         if submit_button:
             submit_button.click()
-            self.logger.info("✅ 已点击提交订单按钮！进入支付页面...")
+            self.logger.info(f"✅ 已点击提交订单按钮！进入支付页面...（⏱ {(time.time() - t0) * 1000:.0f} 毫秒）")
             return True
         self.logger.error("❌ 未找到提交订单按钮元素")
         return False
 
     def add_to_cart_and_checkout_drissionpage(self):
-        """使用 DrissionPage 直接在页面上加入购物车并提交订单"""
-        # 快速通道：API 直接加购，成功后立即提交订单
-        api_result = self.add_to_cart_via_api(quantity=2)
+        """有货后：加手机进购物车（API 优先，页面点击兜底），成功后到第二个页面提交订单"""
+        api_result = self._add_phone_once()
+        if api_result == "cf_blocked":
+            # 三种加车方式打的是同一个接口，被拦后再连发只会被拦得更久：
+            # 页面上真有验证就等人点完再试一次；没有验证（限流）就退避，过一会儿再试
+            if self._wait_user_pass_cf("加入购物车请求"):
+                api_result = self._add_phone_once()
+            if api_result == "cf_blocked":
+                self._note_add_blocked()
+                return False
         if api_result == "ok":
+            self._add_block_streak = 0
+            self._add_retry_at = 0
             return self._submit_order_on_checkout_tab()
-        elif api_result == "cf_blocked":
-            self.logger.warning("⚠️ API加购被Cloudflare拦截")
-            if self._wait_user_pass_cf("API加购"):
-                api_result = self.add_to_cart_via_api(quantity=2)
-                if api_result == "ok":
-                    return self._submit_order_on_checkout_tab()
-            self.logger.warning("⚠️ 验证后 API 仍未加购成功，回退到页面操作")
-        else:
-            self.logger.warning("⚠️ API加购失败，回退到页面操作")
+        self.logger.warning("⚠️ API加购失败，回退到页面操作")
         return self._add_to_cart_via_page_click()
+
+    def _add_phone_once(self):
+        """用 API 加一次手机。返回 "ok" / "fail" / "cf_blocked"。"""
+        # 最快通道：型号编号已提前查好，只发一个加车请求
+        if self.variant_pid:
+            t0 = time.time()
+            self._step(f"有货，直接加车 {self.variant_name} 编号={self.variant_pid} 数量=2")
+            result = self._add_pid_to_cart_via_api(self.variant_pid, 2)
+            self.logger.info(f"⏱ 加车用时 {(time.time() - t0) * 1000:.0f} 毫秒，结果={result}")
+            if result != "fail":
+                return result
+            self.logger.warning("⚠️ 直接加车没成功，改用两步加购（查型号+加车）")
+        t1 = time.time()
+        result = self.add_to_cart_via_api(quantity=2)
+        self.logger.info(f"⏱ 两步加购用时 {(time.time() - t1) * 1000:.0f} 毫秒，结果={result}")
+        return result
+
+    def _note_add_blocked(self):
+        """记下加车被 Cloudflare 拦截，设定下一次允许加车的时间（2、4、8、之后每 15 秒）。"""
+        self._add_block_streak += 1
+        waits = (2, 4, 8, 15)
+        wait = waits[min(self._add_block_streak, len(waits)) - 1]
+        self._add_retry_at = time.time() + wait
+        self.logger.warning(
+            f"⚠️ 加车被 Cloudflare 拦截（连续第 {self._add_block_streak} 次），{wait} 秒后再试；"
+            f"这期间继续查库存，不重复发加车请求"
+        )
+        return wait
 
     def _add_to_cart_via_page_click(self, cf_retries=1):
         """页面操作兜底：选颜色/内存、勾协议、点加入购物车，成功后提交订单。"""
@@ -2174,9 +2383,10 @@ return fetch(arguments[0], {
                 # return True
             else:
                 self.logger.error(f"❌ 加入购物车失败, 状态码: {status}")
-                if status in (403, 429) and cf_retries > 0:
-                    if self._wait_user_pass_cf(f"页面加购 {status}"):
+                if status in (403, 429):
+                    if cf_retries > 0 and self._wait_user_pass_cf(f"页面加购 {status}"):
                         return self._add_to_cart_via_page_click(cf_retries=cf_retries - 1)
+                    self._note_add_blocked()
                 return False
         if not added:
             self.logger.error("❌ 点击加入购物车后 15 秒内没有收到加购响应")
@@ -2428,6 +2638,8 @@ return fetch(arguments[0], {
                 self.logger.error("无法导航到商品页面，终止运行")
                 return
 
+            self.prefetch_variant(attempts=2)
+
             pacer = CheckPacer(CHECK_10_SECONDS)
             self.logger.info(
                 f"开始监控库存，设定每 {pacer.seconds_per_10:g} 秒检查10次（每次间隔 {pacer.period:.2f} 秒）..."
@@ -2448,23 +2660,39 @@ return fetch(arguments[0], {
                         print(f"🔍 第{check_num}次开始检查库存: {goods['name']}, 颜色: {goods['color']}, 内存: {goods['rom']}")
                     # if get_check_stock(goods):
                     # time.sleep(1)
-                    if check_stock_with_selenium2(self.tab, goods):
+                    in_stock = self.check_stock_once(goods)
+                    if in_stock and time.time() < self._add_retry_at:
+                        # 加车刚被 Cloudflare 拦过：还没到重试时间，只查库存不发加车请求
+                        pacer.wait()
+                        if check_num % 10 == 0:
+                            used = pacer.batch_seconds()
+                            self.logger.info(
+                                f"第{check_num}次有货，但加车刚被拦，{max(0, self._add_retry_at - time.time()):.0f} 秒后再试"
+                                f"（最近10次用时 {used:.1f} 秒）"
+                            )
+                        continue
+                    if in_stock:
+                        found_at = time.time()
                         self.logger.info("🎉 有货了，开始加入购物车。")
                         # if self.add_to_cart_and_checkout():
                         if self.add_to_cart_and_checkout_drissionpage():
-                            self.logger.info("🎉 抢购成功！请手动完成后续支付流程。")
+                            self.logger.info(f"🎉 抢购成功！请手动完成后续支付流程。（⏱ 发现有货到点提交共 {time.time() - found_at:.2f} 秒）")
                             try:
                                 is_payment_page = False
-                                for i in range(1, 11):
+                                deadline = time.time() + 10
+                                next_log = 0
+                                while time.time() < deadline:
                                     cur = self.new_tab.url or ""
                                     if "https://onepayment.pccw.com/ecom/web/v2/pay?p=" in cur:
                                         is_payment_page = True
                                         break
-                                    self._step(f"等支付页跳转 {i}/10 当前地址={cur}")
-                                    time.sleep(1)
-                        
+                                    if time.time() >= next_log:
+                                        self._step(f"等支付页跳转 当前地址={cur}")
+                                        next_log = time.time() + 1
+                                    time.sleep(0.2)
+
                                 if is_payment_page:
-                                    self.logger.info("支付页面加载完成")
+                                    self.logger.info(f"支付页面加载完成（⏱ 发现有货到支付页共 {time.time() - found_at:.2f} 秒）")
                                     play_success_sound('y1871.wav', repeat=3)
                                     self.logger.info(f"当前url: {self.new_tab.url}")
                                     
